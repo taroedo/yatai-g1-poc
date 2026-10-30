@@ -1,0 +1,164 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+<meta name="color-scheme" content="light" />
+<title>YATAI G1｜IndexedDB・Web Locks 実機検証</title>
+<style>
+:root{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;color:#152235;background:#f4f7fa}
+*{box-sizing:border-box}body{margin:0}header{background:#17344d;color:white;padding:22px max(16px, calc((100vw - 920px)/2));}
+h1{margin:.1em 0;font-size:1.25rem}p{line-height:1.6}header p{font-size:.88rem;color:#e2edf7;margin:.4em 0}
+main{max-width:940px;margin:auto;padding:14px 14px 64px}section{background:white;border:1px solid #dce5eb;border-radius:12px;padding:16px;margin:14px 0;box-shadow:0 1px 2px #b9c6d033}
+h2{font-size:1.07rem;margin:0 0 12px}button{border:0;background:#0a5b88;color:#fff;font-weight:700;font-size:.95rem;border-radius:9px;padding:12px 15px;min-height:44px;cursor:pointer}
+button:disabled{opacity:.45;cursor:not-allowed}button.secondary{background:#e4eef6;color:#17344d}button.danger{background:#a53728}
+.actions{display:flex;flex-wrap:wrap;gap:9px}.stats{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:8px}
+.stat{padding:12px;border-radius:9px;background:#f1f5f9;min-width:0}.stat b{display:block;font-size:1.08rem;overflow-wrap:anywhere}
+small,.muted{font-size:.82rem;color:#556575}.k{font-size:.78rem;color:#64748b}
+.pill{display:inline-block;border-radius:5px;padding:3px 7px;background:#e4edf3;color:#24425b;font-size:.78rem}.good{background:#ddf4e9;color:#155d40}.bad{background:#ffe7e2;color:#9e2b18}.warn{background:#fff3d2;color:#765500}
+#logs{background:#0d1b2a;color:#d8e7ed;border-radius:8px;max-height:260px;overflow:auto;padding:10px;font:.76rem/1.5 ui-monospace,SFMono-Regular,Consolas,monospace;white-space:pre-wrap;word-break:break-word}
+#records{max-height:210px;overflow:auto;white-space:pre-wrap;background:#f1f5f9;border-radius:8px;padding:9px;font:0.8rem/1.5 ui-monospace,monospace;word-break:break-all}
+.notice{background:#fff5df;border-left:4px solid #d69a18;padding:10px;font-size:.87rem}.subtle{border-top:1px solid #ebf0f3;padding-top:12px;margin-top:12px}
+@media(min-width:600px){.stats{grid-template-columns:repeat(4,minmax(0,1fr))}}
+</style>
+</head>
+<body>
+<header><h1>YATAI G1 実機PoC</h1><p>IndexedDB保存・Web Locks排他・画面復帰の検証専用。Firebase送信なし／実売上データを使用しない。</p></header>
+<main>
+<section><div class="notice"><strong>重要：</strong>これはテスト環境です。商品の販売や実売上の記録には使わないでください。<strong>iPhone/AndroidではHTTPSのURL</strong>からアクセスしてください。別タブの試験は同じ端末・同じブラウザー・同じURLで実施します。</div></section>
+<section>
+<h2>1. 環境とロック状態</h2>
+<div class="stats">
+<div class="stat"><span class="k">接続環境</span><b id="secure">—</b></div>
+<div class="stat"><span class="k">Web Locks</span><b id="locksSupport">—</b></div>
+<div class="stat"><span class="k">IndexedDB</span><b id="idbSupport">—</b></div>
+<div class="stat"><span class="k">現在のタブ状態</span><b id="lockState">開始前</b></div>
+</div>
+<p><span class="pill" id="visibility">visibility —</span> <span class="pill" id="durability">durability —</span> <span class="pill" id="persist">persist —</span></p>
+<div class="actions"><button id="acquire">ロック取得・再試行</button><button id="release" class="secondary">ロックを解放</button><button id="second" class="secondary">同じURLを別タブで開く</button></div>
+<p class="muted">2つ目のタブでは、1つ目が表示中なら競合します。スマートフォンでは新しいタブを開くと1つ目が非表示になり、自動解放して2つ目へ所有権が移る場合もあります。<strong>同時に書込可能なタブが2つにならないこと</strong>を確認してください。</p>
+</section>
+<section>
+<h2>2. IndexedDBの原子的保存</h2>
+<div class="stats"><div class="stat"><span class="k">保存件数</span><b id="count">—</b></div><div class="stat"><span class="k">最終処理</span><b id="last">—</b></div><div class="stat"><span class="k">失敗検出</span><b id="failure">—</b></div><div class="stat"><span class="k">タブID</span><b id="tabId">—</b></div></div>
+<p>テスト取引はランダムID・数量・日時のみ。保存操作は1トランザクションで取引本体とテスト監査印を更新し、<code>complete</code>イベントを成功条件にします。</p>
+<div class="actions"><button id="write">テスト取引を1件保存</button><button id="write20">20件連続保存</button><button id="abort" class="secondary">意図的にabortする</button><button id="reload" class="secondary">再読込して確認</button></div>
+<div class="subtle"><div class="actions"><button id="read" class="secondary">保存状態を再確認</button><button id="copy" class="secondary">診断ログをコピー</button><button id="export" class="secondary">診断JSON保存</button><button id="clear" class="danger">テスト記録を削除</button></div></div>
+<p class="muted">abortテストでは書込みを実行した直後に同一トランザクションを中止します。件数・監査印がどちらも増えないことを確認します。削除操作はこのPoC用DBだけを対象にします。</p>
+<div id="records" aria-label="保存記録">読込前</div>
+</section>
+<section>
+<h2>3. 画面消灯・凍結・強制終了テスト</h2>
+<p>画面をロック、他アプリへ切替、タブを閉じる、ブラウザを強制終了するなどの操作を行い、再開後に「保存状態を再確認」を押してください。各ケースを試験記録に記入します。</p>
+<div class="actions"><button id="simulate" class="secondary">画面非表示を模擬する</button><button id="checkpoint" class="secondary">チェックポイントを記録</button></div>
+<p class="muted">模擬操作はOSの実際のプロセス凍結とは異なります。実機での画面消灯・OS終了試験が必要です。</p>
+</section>
+<section><h2>4. イベントログ（このタブのみ）</h2><div id="logs" role="log" aria-live="polite"></div><p class="muted">診断ログにはブラウザ情報とランダムなテストIDを含みます。実名・実会計情報を入力しないでください。</p></section>
+</main>
+<script>
+(()=>{
+'use strict';
+const DB_NAME='yatai-g1-mobile-poc-v1', DB_VERSION=1, LOCK_NAME='yatai-g1-queue:demo';
+const tabId=(crypto.randomUUID?.()||Math.random().toString(36).slice(2)).slice(0,8);
+const $=id=>document.getElementById(id);
+const state={owner:false,blocked:false,release:null,holdPromise:null,activeOps:0,releaseRequested:false,db:null,events:[],running:false,closed:false,acquiring:false,txStatus:'—',lastError:'—',idbDurability:'—',frozen:false};
+const now=()=>new Date().toISOString();
+const log=(msg,type='info')=>{const item={at:now(),tabId,type,message:msg};state.events.push(item);if(state.events.length>300)state.events.shift();$('logs').textContent=state.events.slice(-55).map(e=>`${e.at.slice(11,23)} [${e.type}] ${e.message}`).join('\n');$('logs').scrollTop=$('logs').scrollHeight;};
+const support={secure:window.isSecureContext,webLocks:!!navigator.locks?.request,indexedDB:!!window.indexedDB,broadcast:!!window.BroadcastChannel};
+const isVisible=()=>document.visibilityState==='visible';
+const canWrite=()=>support.indexedDB&&support.webLocks&&state.owner&&isVisible()&&!state.releaseRequested&&!state.frozen;
+function update(){
+ $('secure').textContent=support.secure?'HTTPS / localhost':'非セキュア';$('locksSupport').textContent=support.webLocks?'対応':'非対応';$('idbSupport').textContent=support.indexedDB?'対応':'非対応';
+ $('lockState').textContent=state.owner?(state.releaseRequested?'解放待ち':'所有中'):(state.acquiring?'取得中':state.blocked?'競合：閲覧専用':'未所有');
+ $('lockState').style.color=state.owner?'#20704e':state.blocked?'#ac3926':'#17344d';
+ $('visibility').textContent=`visibility: ${document.visibilityState}`;
+ $('durability').textContent=`IDB durability: ${state.idbDurability}`;
+ $('persist').textContent=`storage persist: ${state.persistStatus||'未確認'}`;
+ $('tabId').textContent=tabId;$('last').textContent=state.txStatus;$('failure').textContent=state.lastError;
+ for(const id of ['write','write20','abort'])$(id).disabled=!canWrite()||state.running;
+ $('acquire').disabled=state.owner||state.acquiring||!support.webLocks||!support.secure;
+ $('release').disabled=!state.owner;
+ $('clear').disabled=!canWrite()||state.running;
+}
+function closeDB(){if(state.activeOps===0&&state.db){state.db.close();state.db=null;log('IndexedDB接続をクローズ');}}
+function requestRelease(why){state.releaseRequested=true;log(`ロック解放要求: ${why}`);if(state.activeOps===0)finishRelease();update();}
+function finishRelease(){if(!state.owner)return;closeDB();if(state.activeOps!==0)return;state.owner=false;state.releaseRequested=false;state.release?.();state.release=null;log('ロック保持コールバック完了を要求');update();}
+async function acquire(){if(state.owner||state.acquiring||!support.webLocks||!support.secure)return;
+ state.blocked=false;state.acquiring=true;state.frozen=false;update();
+ let resolveReady;const ready=new Promise(r=>resolveReady=r);
+ navigator.locks.request(LOCK_NAME,{mode:'exclusive',ifAvailable:true},async lock=>{
+  if(!lock){state.blocked=true;state.acquiring=false;log('同一オリジンの別タブがロック保持。閲覧専用','warn');resolveReady(false);update();return;}
+  if(!isVisible()){state.acquiring=false;log('非表示のため取得直後に解放','warn');resolveReady(false);return;}
+  state.owner=true;state.blocked=false;state.acquiring=false;state.releaseRequested=false;
+  log('排他ロック取得成功');update();resolveReady(true);
+  await new Promise(resolve=>{state.release=resolve;});
+ }).then(()=>{if(!state.owner)log('ロック要求終了');}).catch(e=>{state.owner=false;state.acquiring=false;state.blocked=true;log(`ロック要求失敗: ${e.name} ${e.message}`,'error');update();resolveReady(false);});
+ return ready;
+}
+function openDB(){if(state.db)return Promise.resolve(state.db);return new Promise((resolve,reject)=>{
+ const req=indexedDB.open(DB_NAME,DB_VERSION);
+ req.onupgradeneeded=()=>{const db=req.result;if(!db.objectStoreNames.contains('sealedOutbox'))db.createObjectStore('sealedOutbox',{keyPath:'transactionId'});if(!db.objectStoreNames.contains('audit'))db.createObjectStore('audit',{keyPath:'id'});};
+ req.onsuccess=()=>{const db=req.result;db.onversionchange=()=>{db.close();if(state.db===db)state.db=null;log('DBバージョン変更：接続解放','warn');};db.onclose=()=>{if(state.db===db)state.db=null;log('IndexedDB接続が予期せず終了','warn');};state.db=db;resolve(db);};
+ req.onerror=()=>reject(req.error);
+ req.onblocked=()=>log('IndexedDBが他タブにブロックされています','warn');
+ });}
+function txStart(db,stores){try{const tx=db.transaction(stores,'readwrite',{durability:'strict'});state.idbDurability=tx.durability||'取得不可';return tx;}catch(e){log('strict指定が失敗したためdefaultで再試行','warn');state.idbDurability='default (fallback)';return db.transaction(stores,'readwrite');}}
+function runTx({count=1,abort=false}={}){return new Promise(async(resolve,reject)=>{
+ if(!canWrite())return reject(new Error('ロック未保持・非表示・競合状態のため操作禁止'));
+ state.activeOps++;state.running=true;update();
+ let completed=false,tx;
+ try{const db=await openDB();if(!canWrite())throw new Error('書込開始前にロック/表示が失効');
+   tx=txStart(db,['sealedOutbox','audit']);
+   // 取引がアクティブな間に非IDB awaitを挟まない。
+   const outbox=tx.objectStore('sealedOutbox'), audit=tx.objectStore('audit');
+   for(let i=0;i<count;i++){
+     const id=crypto.randomUUID?.()||`${Date.now()}-${Math.random()}`;
+     outbox.add({transactionId:id,source:'G1_POC',quantity:1,createdAt:now(),status:'LOCAL_SAVED',tabId});
+     audit.add({id,transactionId:id,marker:'COMMITTED_TOGETHER',createdAt:now()});
+   }
+   tx.oncomplete=()=>{completed=true;state.txStatus=abort?'予期せずcommit':'commit完了';log(`${count}件 + 監査印を1トランザクションでcommit`);resolve({committed:true,count});};
+   tx.onabort=()=>{completed=true;state.txStatus=abort?'意図的abort確認':'abort検出';log(`${count}件トランザクションabort（部分保存なし）`,abort?'info':'warn');if(abort)resolve({committed:false,count});else reject(tx.error||new Error('IndexedDB abort'));};
+   tx.onerror=()=>{log(`IDBトランザクションエラー: ${tx.error?.message||'unknown'}`,'warn');};
+   if(abort)tx.abort(); else if(typeof tx.commit==='function')tx.commit();
+ }catch(e){if(!completed){state.lastError=e.name||'Error';state.txStatus='保存失敗';log(`保存失敗: ${e.message}`,'error');reject(e);}}
+ }).finally(()=>{state.activeOps--;state.running=false;if(state.releaseRequested)finishRelease();update();});}
+function readData(){return new Promise(async(resolve,reject)=>{try{const db=await openDB(),tx=db.transaction(['sealedOutbox','audit'],'readonly');let records,markers;
+ const a=tx.objectStore('sealedOutbox').getAll(), b=tx.objectStore('audit').getAll();a.onsuccess=()=>records=a.result;b.onsuccess=()=>markers=b.result;
+ tx.oncomplete=()=>{const recs=records||[], aud=markers||[];const ids=new Set(recs.map(x=>x.transactionId)), markerIds=new Set(aud.map(x=>x.transactionId));const consistent=recs.length===aud.length&&recs.every(x=>markerIds.has(x.transactionId))&&aud.every(x=>ids.has(x.transactionId));
+ $('count').textContent=`${recs.length}件`;$('records').textContent=recs.slice(-25).map(x=>`${x.createdAt.slice(11,19)}  ${x.transactionId.slice(0,8)}  ${x.status}`).join('\n')||'データなし';log(`再照合: 取引${recs.length}件、監査印${aud.length}件、原子整合${consistent?'OK':'NG'}`,consistent?'info':'error');resolve({count:recs.length,markers:aud.length,consistent});};tx.onerror=()=>reject(tx.error);tx.onabort=()=>reject(tx.error||new Error('read abort'));
+ }catch(e){reject(e);}});}
+async function clearAll(){if(!canWrite()||!confirm('この検証ページ専用のIndexedDB記録を全削除します。よろしいですか？'))return;
+ state.activeOps++;state.running=true;update();try{const db=await openDB();await new Promise((resolve,reject)=>{const tx=txStart(db,['sealedOutbox','audit']);tx.objectStore('sealedOutbox').clear();tx.objectStore('audit').clear();tx.oncomplete=resolve;tx.onabort=()=>reject(tx.error||new Error('abort'));if(tx.commit)tx.commit();});log('テストデータのみ削除');await readData();}catch(e){log(`削除失敗: ${e.message}`,'error');}finally{state.activeOps--;state.running=false;update();}}
+async function exportDiagnostics(){const info={createdAt:now(),testVersion:'g1-poc-v1.0',secureContext:support.secure,userAgent:navigator.userAgent,language:navigator.language,features:{indexedDB:support.indexedDB,webLocks:support.webLocks,broadcastChannel:support.broadcast,storagePersist:state.persistStatus,durability:state.idbDurability},tabId,events:state.events};const blob=new Blob([JSON.stringify(info,null,2)],{type:'application/json'});const url=URL.createObjectURL(blob);const a=document.createElement('a');a.href=url;a.download=`yatai-g1-diagnostics-${new Date().toISOString().slice(0,10)}.json`;a.click();URL.revokeObjectURL(url);}
+function checkpoint(label){log(`チェックポイント: ${label}`);}
+function hideOrFreeze(why){state.frozen=true;log(`非表示・凍結イベント: ${why}`,'warn');requestRelease(why);closeBroadcast();if(state.activeOps===0)closeDB();update();}
+function visible(why){state.frozen=false;openBroadcast();log(`画面復帰: ${why}`);const delay=()=>{if(isVisible())acquire().then(()=>readData().catch(e=>log(`復帰後照合失敗: ${e.message}`,'error')));};if(state.releaseRequested&&state.activeOps>0){log('書込完了後のロック移譲待ち','warn');return;}setTimeout(delay,0);}
+// Event callbacks
+$('acquire').onclick=()=>acquire();$('release').onclick=()=>requestRelease('手動');
+$('second').onclick=()=>{const w=window.open(location.href,'_blank');if(!w)log('ポップアップが拒否されました。同じURLを手動で新タブに開いてください','warn');};
+$('write').onclick=async()=>{try{await runTx();await readData();}catch(e){log(`失敗: ${e.message}`,'error');}};
+$('write20').onclick=async()=>{try{await runTx({count:20});await readData();}catch(e){log(`失敗: ${e.message}`,'error');}};
+$('abort').onclick=async()=>{try{const before=await readData();await runTx({count:1,abort:true});const after=await readData();if(before.count!==after.count)log('重大: abort後に件数が変化','error');else log('PASS: abort後の件数維持');}catch(e){log(`abort試験失敗: ${e.message}`,'error');}};
+$('read').onclick=()=>readData().catch(e=>log(`読込失敗: ${e.message}`,'error'));
+$('reload').onclick=()=>location.reload();$('clear').onclick=clearAll;
+$('copy').onclick=async()=>{const t=JSON.stringify({features:support,events:state.events},null,2);try{await navigator.clipboard.writeText(t);log('診断ログをコピー');}catch(e){log(`コピーできない場合は「診断JSON保存」を使用: ${e.message}`,'warn');}};
+$('export').onclick=exportDiagnostics;
+$('simulate').onclick=()=>{hideOrFreeze('シミュレーション');setTimeout(()=>{state.frozen=false;visible('シミュレーション復帰');},1200);};
+$('checkpoint').onclick=()=>checkpoint('ユーザー操作');
+window.addEventListener('visibilitychange',()=>{if(!isVisible())hideOrFreeze('visibilitychange:hidden');else visible('visibilitychange:visible');});
+window.addEventListener('pagehide',()=>hideOrFreeze('pagehide'));
+window.addEventListener('pageshow',e=>{if(e.persisted)visible('pageshow (bfcache)');});
+window.addEventListener('freeze',()=>hideOrFreeze('freeze'));
+window.addEventListener('resume',()=>visible('resume'));
+window.addEventListener('focus',()=>{if(isVisible()&&!state.owner&&!state.acquiring&&state.activeOps===0)visible('focus');});
+// BroadcastChannel only for diagnostics, never as lock authority.
+let bc;function openBroadcast(){if(bc||!support.broadcast)return;try{bc=new BroadcastChannel('yatai-g1-poc-diagnostics');bc.onmessage=e=>{if(e.data?.type==='owner')log(`別タブのロック所有通知: ${e.data.tabId}`);};}catch(e){log(`BroadcastChannel非対応: ${e.message}`,'warn');}}function closeBroadcast(){if(bc){bc.close();bc=null;}}openBroadcast();
+async function init(){log(`PoC初期化。secure=${support.secure}, locks=${support.webLocks}, idb=${support.indexedDB}`);if(!support.secure)log('HTTPSまたはlocalhostから開く必要があります','error');
+ try{if(navigator.storage?.persisted)state.persistStatus=(await navigator.storage.persisted())?'persisted':'not persisted';else state.persistStatus='APIなし';}catch(e){state.persistStatus='確認不可';}
+ update();if(support.indexedDB)try{await readData();}catch(e){log(`起動時IDB確認失敗: ${e.message}`,'error');}
+ if(support.webLocks&&support.secure&&isVisible())await acquire();if(state.owner&&bc)bc.postMessage({type:'owner',tabId});update();}
+init();
+})();
+</script>
+</body>
+</html>
